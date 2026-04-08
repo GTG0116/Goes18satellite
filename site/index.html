@@ -1,7 +1,7 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>GOES-19 Satellite Viewer</title>
+    <title>GOES-18 Satellite Viewer</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
@@ -109,8 +109,8 @@
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
     <script>
-        // Initialize Map — centered on continental US
-        var map = L.map('map').setView([37, -95], 4);
+        // Initialize Map — centered on the GOES-18 full disk (western hemisphere / Pacific)
+        var map = L.map('map').setView([0, -110], 2);
 
         // Dark base layer
         L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
@@ -119,9 +119,9 @@
             maxZoom: 19
         }).addTo(map);
 
-        // Image bounds — MUST match EXTENT in process_data.py: [-135, -60, 20, 55]
+        // Image bounds — MUST match EXTENT in process_data.py: [-180, -40, -80, 80]
         // Leaflet format: [[south, west], [north, east]]
-        var imageBounds = [[20, -135], [55, -60]];
+        var imageBounds = [[-80, -180], [80, -40]];
         var imageUrl = 'data/';
 
         // Satellite overlay layers — always show the latest frame (_00)
