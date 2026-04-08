@@ -15,13 +15,15 @@ from scipy.ndimage import zoom
 OUTPUT_DIR = 'site/data'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-BUCKET = 'noaa-goes19'
+BUCKET = 'noaa-goes18'
 MAX_FRAMES = 10  # rolling frame buffer per product
 
 # Geographic extent: [west_lon, east_lon, south_lat, north_lat]
 # This MUST match the imageBounds in site/index.html
-# GOES-19 CONUS sector extends to ~135.7°W; use -135 to capture the full west coast.
-EXTENT = [-135, -60, 20, 55]
+# GOES-18 Full Disk covers the full hemisphere from ~141°E to ~55°W.
+# Using -180 as the western bound keeps coordinates within Leaflet's
+# standard range while capturing the full Americas + Pacific visible disk.
+EXTENT = [-180, -40, -80, 80]
 
 
 # ---------------------------------------------------------------------------
@@ -117,11 +119,11 @@ def shift_frames(product_base):
 # Helpers
 # ---------------------------------------------------------------------------
 
-def get_latest_goes_file(s3_client, band, domain='C'):
-    """Find the most recent GOES-19 ABI CMIP file for a given band.
+def get_latest_goes_file(s3_client, band, domain='F'):
+    """Find the most recent GOES-18 ABI CMIP file for a given band.
 
     Searches backwards up to 6 hours to find the latest available file.
-    Domain 'C' = CONUS, 'F' = Full Disk, 'M' = Mesoscale.
+    Domain 'F' = Full Disk, 'C' = CONUS, 'M' = Mesoscale.
     """
     now = datetime.now(timezone.utc)
 
@@ -132,7 +134,7 @@ def get_latest_goes_file(s3_client, band, domain='C'):
         hour = t.strftime('%H')
 
         prefix   = f'ABI-L2-CMIP{domain}/{year}/{doy}/{hour}/'
-        band_str = f'C{band:02d}_G19'
+        band_str = f'C{band:02d}_G18'
 
         try:
             resp  = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
@@ -169,7 +171,7 @@ def _make_figure():
 
 
 def _download_band(s3_client, band_num):
-    """Download a GOES-19 ABI band.
+    """Download a GOES-18 ABI band (Full Disk).
 
     Returns (data_array, x_metres, y_metres, goes_proj).
     data_array contains raw float values with NaNs intact (no fill applied).
@@ -218,7 +220,7 @@ def _download_band(s3_client, band_num):
 # ---------------------------------------------------------------------------
 
 def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, gamma=1.0):
-    """Download and render a single GOES-19 ABI band as a transparent PNG.
+    """Download and render a single GOES-18 ABI Full Disk band as a transparent PNG.
 
     gamma – optional power-law correction applied after normalising to [0, 1].
             gamma < 1 brightens the image (e.g. 0.5 = square-root stretch).
@@ -478,12 +480,12 @@ def _render_geocolor_night(s3_client):
 # ---------------------------------------------------------------------------
 
 def main():
-    print("GOES-19 Satellite Image Processor")
+    print("GOES-18 Satellite Image Processor (Full Disk)")
     print("=" * 40)
     print(f"Extent: {EXTENT}")
     print(f"Bucket: s3://{BUCKET}")
 
-    # Anonymous access — GOES-19 bucket is publicly readable
+    # Anonymous access — GOES-18 bucket is publicly readable
     s3 = boto3.client(
         's3',
         region_name='us-east-1',
