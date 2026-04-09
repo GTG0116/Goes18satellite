@@ -25,6 +25,12 @@ MAX_FRAMES = 10  # rolling frame buffer per product
 # standard range while capturing the full Americas + Pacific visible disk.
 EXTENT = [-180, -40, -80, 80]
 
+# Full-disk bands are enormous (Band 2: ~21 696×21 696; Band 13: ~5 424×5 424).
+# Subsample so that neither dimension exceeds this value before rendering.
+# 2048 gives excellent visual quality at the output DPI while keeping render
+# times under a minute.
+MAX_PIXELS = 2048
+
 
 # ---------------------------------------------------------------------------
 # Custom colour maps
@@ -196,12 +202,23 @@ def _download_band(s3_client, band_num):
         sat_sweep = str(proj_var.attrs['sweep_angle_axis'])
         x = ds['x'].values * sat_h
         y = ds['y'].values * sat_h
+        ds.close()
+
+        # Subsample full-disk arrays to MAX_PIXELS so rendering stays fast.
+        h, w = cmi.shape
+        sy = max(1, h // MAX_PIXELS)
+        sx = max(1, w // MAX_PIXELS)
+        if sy > 1 or sx > 1:
+            cmi = cmi[::sy, ::sx]
+            x   = x[::sx]
+            y   = y[::sy]
+            print(f"  Subsampled Band {band_num}: {h}×{w} → {cmi.shape[0]}×{cmi.shape[1]}")
+
         goes_proj = ccrs.Geostationary(
             central_longitude=sat_lon,
             satellite_height=sat_h,
             sweep_axis=sat_sweep,
         )
-        ds.close()
         return cmi, x, y, goes_proj
 
     except Exception as e:
@@ -238,12 +255,7 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
         s3_client.download_file(BUCKET, key, local_file)
 
         ds       = xr.open_dataset(local_file, engine='netcdf4')
-        cmi_data = ds['CMI'].values  # Reflectance [0-1] for visible; BT [K] for IR/WV
-
-        # Apply gamma correction if requested (normalise → gamma → restore range)
-        if gamma != 1.0:
-            normed   = np.clip((cmi_data - vmin) / (vmax - vmin), 0.0, 1.0)
-            cmi_data = np.power(normed, gamma) * (vmax - vmin) + vmin
+        cmi_data = ds['CMI'].values.astype(np.float32)  # Reflectance or BT [K]
 
         # --- Projection parameters from the file ---
         proj_var  = ds['goes_imager_projection']
@@ -254,7 +266,24 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
         # Convert scan angles (radians) → projection coordinates (meters)
         x = ds['x'].values * sat_h
         y = ds['y'].values * sat_h
-        X, Y = np.meshgrid(x, y)
+        ds.close()
+
+        # Subsample full-disk arrays to MAX_PIXELS — pcolormesh on 21 k×21 k
+        # quads would never finish; imshow + subsampling is orders of magnitude
+        # faster and produces identical visual output at the output DPI.
+        h, w = cmi_data.shape
+        sy = max(1, h // MAX_PIXELS)
+        sx = max(1, w // MAX_PIXELS)
+        if sy > 1 or sx > 1:
+            cmi_data = cmi_data[::sy, ::sx]
+            x        = x[::sx]
+            y        = y[::sy]
+            print(f"  Subsampled: {h}×{w} → {cmi_data.shape[0]}×{cmi_data.shape[1]}")
+
+        # Apply gamma correction if requested (normalise → gamma → restore range)
+        if gamma != 1.0:
+            normed   = np.clip((cmi_data - vmin) / (vmax - vmin), 0.0, 1.0)
+            cmi_data = np.power(normed, gamma) * (vmax - vmin) + vmin
 
         goes_proj = ccrs.Geostationary(
             central_longitude=sat_lon,
@@ -264,13 +293,19 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
 
         fig, ax = _make_figure()
 
-        ax.pcolormesh(
-            X, Y, cmi_data,
+        # imshow is dramatically faster than pcolormesh for regular grids.
+        # extent = (left, right, bottom, top) in projection coordinates;
+        # y[0] is the northernmost scan line (largest y value).
+        ax.imshow(
+            cmi_data,
+            origin='upper',
+            extent=(x[0], x[-1], y[-1], y[0]),
             transform=goes_proj,
+            aspect='auto',
+            interpolation='nearest',
             cmap=colormap,
             vmin=vmin,
             vmax=vmax,
-            shading='auto'
         )
 
         product_base = output_filename.replace('.png', '')
@@ -279,8 +314,6 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
         plt.savefig(output_path, dpi=300, transparent=True)
         plt.close()
         print(f"  Saved: {output_path}")
-
-        ds.close()
 
     except Exception as e:
         print(f"  ERROR: {e}")
@@ -485,11 +518,18 @@ def main():
     print(f"Extent: {EXTENT}")
     print(f"Bucket: s3://{BUCKET}")
 
-    # Anonymous access — GOES-18 bucket is publicly readable
+    # Anonymous access — GOES-18 bucket is publicly readable.
+    # Full-disk files can be several hundred MB; set generous timeouts so the
+    # client doesn't hang silently and allows GitHub Actions to fail fast.
     s3 = boto3.client(
         's3',
         region_name='us-east-1',
-        config=Config(signature_version=UNSIGNED)
+        config=Config(
+            signature_version=UNSIGNED,
+            connect_timeout=30,
+            read_timeout=600,   # 10 min — large full-disk files can be 200+ MB
+            retries={'max_attempts': 2},
+        )
     )
 
     # Band 2  — Visible (0.64 µm)              reflectance [0.0 – 1.0]
