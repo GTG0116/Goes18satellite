@@ -159,30 +159,40 @@ def get_latest_goes_file(s3_client, band, domain='F'):
 
 
 def _make_figure():
-    """Create a figure rendered in Web Mercator to match Leaflet's basemap.
+    """Create a figure rendered in Web Mercator (EPSG:3857) to match Leaflet.
 
-    Rendering in PlateCarree then overlaying on Mercator causes severe
-    squishing at high latitudes: Mercator stretches ±80° enormously, but
-    PlateCarree distributes pixels evenly.  By rendering in Mercator the
-    pixel distribution in the output PNG exactly matches what Leaflet
-    expects, so coastlines and data line up at all latitudes.
+    Leaflet uses spherical Web Mercator (EPSG:3857) with a fixed sphere radius
+    of 6 378 137 m.  Cartopy's default ccrs.Mercator() uses the WGS-84
+    ellipsoid, whose Mercator formula diverges from the spherical one at high
+    latitudes (noticeable above ~60°).  Forcing the same spherical globe and
+    setting the axes limits directly in metres (instead of relying on
+    set_extent, which can add internal padding) ensures pixel-perfect alignment
+    between the rendered PNG and Leaflet's basemap at all latitudes.
     """
-    # Compute Mercator y-span so the figure aspect ratio is correct.
-    # Mercator y = ln(tan(π/4 + φ/2)) (unitless; same formula Leaflet uses)
-    lat_s = np.radians(EXTENT[2])
-    lat_n = np.radians(EXTENT[3])
-    y_min = np.log(np.tan(np.pi / 4 + lat_s / 2))
-    y_max = np.log(np.tan(np.pi / 4 + lat_n / 2))
+    R = 6378137.0  # Web Mercator / EPSG:3857 sphere radius in metres
 
-    lon_range_rad = np.radians(EXTENT[1] - EXTENT[0])
-    mercator_aspect = (y_max - y_min) / lon_range_rad  # height / width
+    # Compute Web Mercator x/y limits in metres — same formula Leaflet uses
+    x_min = R * np.radians(EXTENT[0])  # west longitude
+    x_max = R * np.radians(EXTENT[1])  # east longitude
+    y_min = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[2]) / 2))  # south lat
+    y_max = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[3]) / 2))  # north lat
+
+    # Aspect ratio in metres (height / width) for the correct figure proportions
+    mercator_aspect = (y_max - y_min) / (x_max - x_min)
 
     fig_width  = 12.0
     fig_height = fig_width * mercator_aspect
 
+    # Spherical Web Mercator globe — must match Leaflet/EPSG:3857
+    web_mercator = ccrs.Mercator(
+        globe=ccrs.Globe(semimajor_axis=R, semiminor_axis=R)
+    )
+
     fig = plt.figure(figsize=(fig_width, fig_height))
-    ax  = fig.add_axes([0, 0, 1, 1], projection=ccrs.Mercator())
-    ax.set_extent(EXTENT, crs=ccrs.PlateCarree())
+    ax  = fig.add_axes([0, 0, 1, 1], projection=web_mercator)
+    # Set limits directly in projected metres — avoids set_extent padding/rounding
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
     ax.set_aspect('auto')  # fill the axes exactly; no equal-aspect padding
     ax.set_axis_off()
     fig.patch.set_alpha(0.0)

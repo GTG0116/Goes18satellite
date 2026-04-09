@@ -28,17 +28,44 @@
             font-size: 12px;
         }
 
-        #frame-indicator {
+        /* ---- Animation control bar ---- */
+        #animation-controls {
             position: absolute;
-            bottom: 30px;
+            bottom: 10px;
             left: 10px;
             z-index: 1000;
-            background: rgba(0,0,0,0.6);
-            color: #7cf;
-            padding: 4px 10px;
-            border-radius: 4px;
+            background: rgba(0,0,0,0.7);
+            color: #fff;
+            padding: 5px 10px;
+            border-radius: 6px;
             font-family: monospace;
             font-size: 12px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            user-select: none;
+        }
+        #play-pause-btn {
+            background: none;
+            border: 1px solid #666;
+            color: #fff;
+            cursor: pointer;
+            padding: 1px 7px;
+            border-radius: 3px;
+            font-size: 13px;
+            line-height: 1.4;
+            flex-shrink: 0;
+        }
+        #play-pause-btn:hover { border-color: #fff; }
+        #frame-slider {
+            width: 130px;
+            cursor: pointer;
+            accent-color: #7cf;
+        }
+        #frame-label {
+            min-width: 52px;
+            color: #7cf;
+            text-align: right;
         }
 
         /* ---- Legend panel ---- */
@@ -104,7 +131,11 @@
 <body>
     <div id="map"></div>
     <div id="timestamp">Loading...</div>
-    <div id="frame-indicator">▶ LIVE</div>
+    <div id="animation-controls">
+        <button id="play-pause-btn" title="Play / Pause">⏸</button>
+        <input type="range" id="frame-slider" min="0" max="9" value="9" step="1" title="Select frame">
+        <span id="frame-label">▶ LIVE</span>
+    </div>
     <div id="legend"></div>
 
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -240,9 +271,14 @@
         // Frame animation — cycles through the 10-frame rolling buffer
         // Frame 00 = newest (LIVE), Frame 09 = oldest (~9 h ago)
         // Plays oldest→newest then loops: 9, 8, 7, …, 1, 0, 9, 8, …
+        //
+        // Slider convention: value 0 = oldest (frame 09), value 9 = newest (frame 00)
+        //   currentFrame  = NUM_FRAMES - 1 - slider.value
+        //   slider.value  = NUM_FRAMES - 1 - currentFrame
         // ----------------------------------------------------------------
-        var NUM_FRAMES    = 10;
-        var currentFrame  = NUM_FRAMES - 1;   // start at oldest
+        var NUM_FRAMES   = 10;
+        var currentFrame = NUM_FRAMES - 1;   // start at oldest
+        var isPlaying    = true;
 
         var layerProducts = [
             { layer: geocolorLayer,   product: 'geocolor'    },
@@ -262,17 +298,36 @@
                     lp.layer.setUrl(frameUrl(lp.product, currentFrame));
                 }
             });
-            var ind = document.getElementById('frame-indicator');
+            var label  = document.getElementById('frame-label');
+            var slider = document.getElementById('frame-slider');
             if (currentFrame === 0) {
-                ind.textContent = '▶ LIVE';
-                ind.style.color = '#7cf';
+                label.textContent = '▶ LIVE';
+                label.style.color = '#7cf';
             } else {
-                ind.textContent = '▶ -' + currentFrame + 'h';
-                ind.style.color = '#fa8';
+                label.textContent = '▶ -' + currentFrame + 'h';
+                label.style.color = '#fa8';
             }
+            // Keep slider in sync (slider 0 = oldest, slider N-1 = newest)
+            slider.value = NUM_FRAMES - 1 - currentFrame;
         }
 
+        // Play / Pause button
+        document.getElementById('play-pause-btn').addEventListener('click', function() {
+            isPlaying = !isPlaying;
+            this.textContent = isPlaying ? '⏸' : '▶';
+        });
+
+        // Frame slider — drag or click to jump to any frame
+        document.getElementById('frame-slider').addEventListener('input', function() {
+            // Pause playback when the user manually selects a frame
+            isPlaying = false;
+            document.getElementById('play-pause-btn').textContent = '▶';
+            currentFrame = NUM_FRAMES - 1 - parseInt(this.value, 10);
+            updateAnimationFrame();
+        });
+
         setInterval(function() {
+            if (!isPlaying) return;
             // Advance one step older→newer; wrap newest back to oldest
             currentFrame = (currentFrame - 1 + NUM_FRAMES) % NUM_FRAMES;
             updateAnimationFrame();
