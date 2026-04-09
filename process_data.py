@@ -20,10 +20,11 @@ MAX_FRAMES = 10  # rolling frame buffer per product
 
 # Geographic extent: [west_lon, east_lon, south_lat, north_lat]
 # This MUST match the imageBounds in site/index.html
-# GOES-18 Full Disk covers the full hemisphere from ~141°E to ~55°W.
-# Using -180 as the western bound keeps coordinates within Leaflet's
-# standard range while capturing the full Americas + Pacific visible disk.
-EXTENT = [-180, -40, -80, 80]
+# GOES-18 Full Disk covers the full hemisphere from ~142°E to ~56°W.
+# Expressed as extended western longitudes: 142°E = -218°W (i.e. -218).
+# This avoids splitting the disk at the antimeridian.
+SATELLITE_LON = -137.0   # approximate GOES-18 nadir longitude
+EXTENT = [-220, -55, -80, 80]
 
 # Full-disk bands are enormous (Band 2: ~21 696×21 696; Band 13: ~5 424×5 424).
 # Subsample so that neither dimension exceeds this value before rendering.
@@ -159,21 +160,24 @@ def get_latest_goes_file(s3_client, band, domain='F'):
 
 
 def _make_figure():
-    """Create a figure rendered in Web Mercator (EPSG:3857) to match Leaflet.
+    """Create a figure rendered in satellite-centred Web Mercator to match Leaflet.
 
     Leaflet uses spherical Web Mercator (EPSG:3857) with a fixed sphere radius
-    of 6 378 137 m.  Cartopy's default ccrs.Mercator() uses the WGS-84
-    ellipsoid, whose Mercator formula diverges from the spherical one at high
-    latitudes (noticeable above ~60°).  Forcing the same spherical globe and
-    setting the axes limits directly in metres (instead of relying on
-    set_extent, which can add internal padding) ensures pixel-perfect alignment
-    between the rendered PNG and Leaflet's basemap at all latitudes.
+    of 6 378 137 m.  The GOES-18 full disk spans from ~142°E to ~56°W, which
+    straddles the antimeridian in standard Mercator (central_longitude=0°).
+    Using central_longitude=SATELLITE_LON shifts the x-axis so the entire
+    disk falls within a single continuous x range, avoiding the antimeridian
+    split.  The formula is identical to EPSG:3857 — just a constant x-offset —
+    so Leaflet's imageBounds (which use geographic lat/lon) still align the
+    overlay pixel-perfectly with the basemap at all latitudes.
     """
     R = 6378137.0  # Web Mercator / EPSG:3857 sphere radius in metres
 
-    # Compute Web Mercator x/y limits in metres — same formula Leaflet uses
-    x_min = R * np.radians(EXTENT[0])  # west longitude
-    x_max = R * np.radians(EXTENT[1])  # east longitude
+    # x limits in satellite-centred Mercator metres.
+    # EXTENT longitudes are geographic; subtract SATELLITE_LON to get the
+    # offset from the projection's central meridian.
+    x_min = R * np.radians(EXTENT[0] - SATELLITE_LON)  # west edge
+    x_max = R * np.radians(EXTENT[1] - SATELLITE_LON)  # east edge
     y_min = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[2]) / 2))  # south lat
     y_max = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[3]) / 2))  # north lat
 
@@ -183,8 +187,10 @@ def _make_figure():
     fig_width  = 12.0
     fig_height = fig_width * mercator_aspect
 
-    # Spherical Web Mercator globe — must match Leaflet/EPSG:3857
+    # Spherical Mercator centred on the satellite nadir — matches EPSG:3857
+    # but shifted so the full disk doesn't straddle the antimeridian.
     web_mercator = ccrs.Mercator(
+        central_longitude=SATELLITE_LON,
         globe=ccrs.Globe(semimajor_axis=R, semiminor_axis=R)
     )
 
