@@ -155,19 +155,31 @@
         // so Leaflet places the overlay continuously across the antimeridian.
         // Leaflet format: [[south, west], [north, east]]
         var imageBounds = [[-80, -220], [80, -55]];
+        // CONUS sector bounds — matches CONUS_EXTENT in process_data.py: [-135, -60, 15, 55]
+        var conusBounds = [[15, -135], [55, -60]];
         var imageUrl = 'data/';
 
-        // Satellite overlay layers — always show the latest frame (_00)
+        // Full-disk satellite overlay layers — always show the latest frame (_00)
         var geocolorLayer   = L.imageOverlay(imageUrl + 'geocolor_00.png',    imageBounds, {opacity: 0.95});
         var visibleLayer    = L.imageOverlay(imageUrl + 'visible_00.png',     imageBounds, {opacity: 0.85});
         var infraredLayer   = L.imageOverlay(imageUrl + 'infrared_00.png',    imageBounds, {opacity: 0.85});
         var waterVaporLayer = L.imageOverlay(imageUrl + 'water_vapor_00.png', imageBounds, {opacity: 0.85});
 
+        // CONUS sector overlay layers
+        var conusGeocolorLayer   = L.imageOverlay(imageUrl + 'conus_geocolor_00.png',    conusBounds, {opacity: 0.95});
+        var conusVisibleLayer    = L.imageOverlay(imageUrl + 'conus_visible_00.png',     conusBounds, {opacity: 0.85});
+        var conusInfraredLayer   = L.imageOverlay(imageUrl + 'conus_infrared_00.png',    conusBounds, {opacity: 0.85});
+        var conusWaterVaporLayer = L.imageOverlay(imageUrl + 'conus_water_vapor_00.png', conusBounds, {opacity: 0.85});
+
         var overlayMaps = {
-            "GeoColor (RGB)":       geocolorLayer,
-            "Visible (Band 2)":     visibleLayer,
-            "Infrared (Band 13)":   infraredLayer,
-            "Water Vapor (Band 9)": waterVaporLayer
+            "GeoColor (RGB)":              geocolorLayer,
+            "Visible (Band 2)":            visibleLayer,
+            "Infrared (Band 13)":          infraredLayer,
+            "Water Vapor (Band 9)":        waterVaporLayer,
+            "CONUS GeoColor":              conusGeocolorLayer,
+            "CONUS Visible (Band 2)":      conusVisibleLayer,
+            "CONUS Infrared (Band 13)":    conusInfraredLayer,
+            "CONUS Water Vapor (Band 9)":  conusWaterVaporLayer
         };
 
         L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
@@ -253,10 +265,14 @@
 
         // Priority order when multiple layers are active: IR > WV > Visible > GeoColor
         var legendPriority = [
-            { layer: infraredLayer,   key: 'infrared'   },
-            { layer: waterVaporLayer, key: 'watervapor' },
-            { layer: visibleLayer,    key: 'visible'    },
-            { layer: geocolorLayer,   key: 'geocolor'   }
+            { layer: infraredLayer,        key: 'infrared'   },
+            { layer: conusInfraredLayer,   key: 'infrared'   },
+            { layer: waterVaporLayer,      key: 'watervapor' },
+            { layer: conusWaterVaporLayer, key: 'watervapor' },
+            { layer: visibleLayer,         key: 'visible'    },
+            { layer: conusVisibleLayer,    key: 'visible'    },
+            { layer: geocolorLayer,        key: 'geocolor'   },
+            { layer: conusGeocolorLayer,   key: 'geocolor'   }
         ];
 
         function updateLegend() {
@@ -283,10 +299,14 @@
         var isPlaying    = true;
 
         var layerProducts = [
-            { layer: geocolorLayer,   product: 'geocolor'    },
-            { layer: visibleLayer,    product: 'visible'     },
-            { layer: infraredLayer,   product: 'infrared'    },
-            { layer: waterVaporLayer, product: 'water_vapor' }
+            { layer: geocolorLayer,        product: 'geocolor'          },
+            { layer: visibleLayer,         product: 'visible'           },
+            { layer: infraredLayer,        product: 'infrared'          },
+            { layer: waterVaporLayer,      product: 'water_vapor'       },
+            { layer: conusGeocolorLayer,   product: 'conus_geocolor'    },
+            { layer: conusVisibleLayer,    product: 'conus_visible'     },
+            { layer: conusInfraredLayer,   product: 'conus_infrared'    },
+            { layer: conusWaterVaporLayer, product: 'conus_water_vapor' }
         ];
 
         function frameUrl(product, index) {

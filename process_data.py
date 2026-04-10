@@ -26,6 +26,9 @@ MAX_FRAMES = 10  # rolling frame buffer per product
 SATELLITE_LON = -137.0   # approximate GOES-18 nadir longitude
 EXTENT = [-220, -55, -80, 80]
 
+# CONUS sector geographic extent: [west_lon, east_lon, south_lat, north_lat]
+CONUS_EXTENT = [-135, -60, 15, 55]
+
 # Full-disk bands are enormous (Band 2: ~21 696×21 696; Band 13: ~5 424×5 424).
 # Subsample so that neither dimension exceeds this value before rendering.
 # 2048 gives excellent visual quality at the output DPI while keeping render
@@ -159,7 +162,7 @@ def get_latest_goes_file(s3_client, band, domain='F'):
     return None
 
 
-def _make_figure():
+def _make_figure(extent=None):
     """Create a figure rendered in satellite-centred Web Mercator to match Leaflet.
 
     Leaflet uses spherical Web Mercator (EPSG:3857) with a fixed sphere radius
@@ -170,16 +173,20 @@ def _make_figure():
     split.  The formula is identical to EPSG:3857 — just a constant x-offset —
     so Leaflet's imageBounds (which use geographic lat/lon) still align the
     overlay pixel-perfectly with the basemap at all latitudes.
+
+    extent – [west_lon, east_lon, south_lat, north_lat]; defaults to EXTENT.
     """
+    if extent is None:
+        extent = EXTENT
     R = 6378137.0  # Web Mercator / EPSG:3857 sphere radius in metres
 
     # x limits in satellite-centred Mercator metres.
-    # EXTENT longitudes are geographic; subtract SATELLITE_LON to get the
+    # extent longitudes are geographic; subtract SATELLITE_LON to get the
     # offset from the projection's central meridian.
-    x_min = R * np.radians(EXTENT[0] - SATELLITE_LON)  # west edge
-    x_max = R * np.radians(EXTENT[1] - SATELLITE_LON)  # east edge
-    y_min = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[2]) / 2))  # south lat
-    y_max = R * np.log(np.tan(np.pi / 4 + np.radians(EXTENT[3]) / 2))  # north lat
+    x_min = R * np.radians(extent[0] - SATELLITE_LON)  # west edge
+    x_max = R * np.radians(extent[1] - SATELLITE_LON)  # east edge
+    y_min = R * np.log(np.tan(np.pi / 4 + np.radians(extent[2]) / 2))  # south lat
+    y_max = R * np.log(np.tan(np.pi / 4 + np.radians(extent[3]) / 2))  # north lat
 
     # Aspect ratio in metres (height / width) for the correct figure proportions
     mercator_aspect = (y_max - y_min) / (x_max - x_min)
@@ -206,15 +213,16 @@ def _make_figure():
     return fig, ax
 
 
-def _download_band(s3_client, band_num):
-    """Download a GOES-18 ABI band (Full Disk).
+def _download_band(s3_client, band_num, domain='F'):
+    """Download a GOES-18 ABI band.
 
+    domain – 'F' = Full Disk, 'C' = CONUS, 'M' = Mesoscale.
     Returns (data_array, x_metres, y_metres, goes_proj).
     data_array contains raw float values with NaNs intact (no fill applied).
     Returns (None, None, None, None) on any failure.
     """
-    print(f"  Downloading Band {band_num}...")
-    key = get_latest_goes_file(s3_client, band_num)
+    print(f"  Downloading Band {band_num} (domain={domain})...")
+    key = get_latest_goes_file(s3_client, band_num, domain=domain)
     if key is None:
         print(f"  ERROR: No Band {band_num} data found in the last 6 hours.")
         return None, None, None, None
@@ -266,15 +274,18 @@ def _download_band(s3_client, band_num):
 # Single-band renderer
 # ---------------------------------------------------------------------------
 
-def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, gamma=1.0):
-    """Download and render a single GOES-18 ABI Full Disk band as a transparent PNG.
+def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax,
+                      gamma=1.0, domain='F', extent=None):
+    """Download and render a single GOES-18 ABI band as a transparent PNG.
 
-    gamma – optional power-law correction applied after normalising to [0, 1].
-            gamma < 1 brightens the image (e.g. 0.5 = square-root stretch).
+    gamma  – optional power-law correction applied after normalising to [0, 1].
+             gamma < 1 brightens the image (e.g. 0.5 = square-root stretch).
+    domain – 'F' = Full Disk, 'C' = CONUS, 'M' = Mesoscale.
+    extent – geographic extent [W, E, S, N]; defaults to EXTENT (full disk).
     """
-    print(f"\n--- Band {band}: {output_filename} ---")
+    print(f"\n--- Band {band}: {output_filename} (domain={domain}) ---")
 
-    key = get_latest_goes_file(s3_client, band)
+    key = get_latest_goes_file(s3_client, band, domain=domain)
     if key is None:
         print(f"  ERROR: No Band {band} data found in the last 6 hours. Skipping.")
         return
@@ -321,7 +332,7 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
             sweep_axis=sat_sweep
         )
 
-        fig, ax = _make_figure()
+        fig, ax = _make_figure(extent=extent)
 
         # imshow is dramatically faster than pcolormesh for regular grids.
         # extent = (left, right, bottom, top) in projection coordinates;
@@ -359,22 +370,26 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
 # GeoColor composite (day / night)
 # ---------------------------------------------------------------------------
 
-def process_geocolor(s3_client):
+def process_geocolor(s3_client, domain='F', extent=None, output_prefix=''):
     """GeoColor RGB composite.
 
     Daytime  – pseudo-natural colour from Bands 1 and 2 with gamma correction.
     Nighttime – IR cloud layer (Band 13) blended with city-lights proxy
                 (Band 7 minus thermal background) on a transparent background.
+
+    domain        – 'F' = Full Disk, 'C' = CONUS, 'M' = Mesoscale.
+    extent        – geographic extent [W, E, S, N]; defaults to EXTENT.
+    output_prefix – prefix prepended to output filenames (e.g. 'conus_').
     """
-    print(f"\n--- GeoColor RGB Composite ---")
+    print(f"\n--- GeoColor RGB Composite (domain={domain}) ---")
 
     # Fetch the two visible bands needed for the RGB composite
-    b1, x1, y1, goes_proj = _download_band(s3_client, 1)
+    b1, x1, y1, goes_proj = _download_band(s3_client, 1, domain=domain)
     if b1 is None:
         print("  ERROR: Missing Band 1. Skipping GeoColor.")
         return
 
-    b2, x2, y2, _ = _download_band(s3_client, 2)
+    b2, x2, y2, _ = _download_band(s3_client, 2, domain=domain)
     if b2 is None:
         print("  ERROR: Missing Band 2. Skipping GeoColor.")
         return
@@ -395,13 +410,16 @@ def process_geocolor(s3_client):
 
     if is_daytime:
         # Fetch Band 13 for cloud-top enhancement (failure is non-fatal)
-        bt13, *_ = _download_band(s3_client, 13)
-        _render_geocolor_day(b1, b2, x1, y1, goes_proj, bt13)
+        bt13, *_ = _download_band(s3_client, 13, domain=domain)
+        _render_geocolor_day(b1, b2, x1, y1, goes_proj, bt13,
+                             extent=extent, output_prefix=output_prefix)
     else:
-        _render_geocolor_night(s3_client)
+        _render_geocolor_night(s3_client, domain=domain,
+                               extent=extent, output_prefix=output_prefix)
 
 
-def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None):
+def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None,
+                         extent=None, output_prefix=''):
     """Pseudo-natural colour composite for daytime.
 
     bt13 is an optional Band 13 brightness-temperature array (same spatial
@@ -440,19 +458,20 @@ def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None):
         B = np.clip(B + cloud_enhance * (1.0 - B) * (strength + 0.05), 0.0, 1.0)
 
     rgb = np.dstack([R, G, B])
-    fig, ax = _make_figure()
+    fig, ax = _make_figure(extent=extent)
     img_extent = (x[0], x[-1], y[-1], y[0])
     ax.imshow(rgb, origin='upper', extent=img_extent,
               transform=goes_proj, aspect='auto', interpolation='none')
 
-    shift_frames('geocolor')
-    output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
+    product_base = f'{output_prefix}geocolor'
+    shift_frames(product_base)
+    output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
     plt.savefig(output_path, dpi=150, transparent=True)
     plt.close()
     print(f"  Saved (daytime): {output_path}")
 
 
-def _render_geocolor_night(s3_client):
+def _render_geocolor_night(s3_client, domain='F', extent=None, output_prefix=''):
     """Nighttime GeoColor composite.
 
     Cloud layer  – derived from Band 13 (10.35 µm clean IR window).
@@ -464,7 +483,7 @@ def _render_geocolor_night(s3_client):
     Background   – fully transparent so the dark basemap shows through.
     """
     # Band 13: brightness temperature (K), same 2 km resolution as Band 7
-    bt13, x13, y13, goes_proj = _download_band(s3_client, 13)
+    bt13, x13, y13, goes_proj = _download_band(s3_client, 13, domain=domain)
     if bt13 is None:
         print("  ERROR: Missing Band 13 for nighttime GeoColor. Skipping.")
         return
@@ -473,7 +492,7 @@ def _render_geocolor_night(s3_client):
     bt13 = np.where(np.isnan(bt13), 320.0, bt13)
 
     # Band 7: 3.9 µm shortwave IR — optional; gracefully absent
-    bt7, x7, y7, _ = _download_band(s3_client, 7)
+    bt7, x7, y7, _ = _download_band(s3_client, 7, domain=domain)
 
     h, w = bt13.shape
 
@@ -526,13 +545,14 @@ def _render_geocolor_night(s3_client):
 
     rgba = np.dstack([R, G, B, A]).astype(np.float32)
 
-    fig, ax = _make_figure()
+    fig, ax = _make_figure(extent=extent)
     img_extent = (x13[0], x13[-1], y13[-1], y13[0])
     ax.imshow(rgba, origin='upper', extent=img_extent,
               transform=goes_proj, aspect='auto', interpolation='none')
 
-    shift_frames('geocolor')
-    output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
+    product_base = f'{output_prefix}geocolor'
+    shift_frames(product_base)
+    output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
     plt.savefig(output_path, dpi=150, transparent=True)
     plt.close()
     print(f"  Saved (nighttime): {output_path}")
@@ -577,6 +597,12 @@ def main():
 
     # GeoColor — natural colour (day) or IR+city-lights composite (night)
     process_geocolor(s3)
+
+    # --- CONUS sector products (higher resolution over the continental US) ---
+    process_goes_band(s3, 2,  'conus_visible.png',    'gray',          vmin=0.0, vmax=1.0, gamma=0.5, domain='C', extent=CONUS_EXTENT)
+    process_goes_band(s3, 13, 'conus_infrared.png',   _ir_colormap(),  vmin=190, vmax=310, domain='C', extent=CONUS_EXTENT)
+    process_goes_band(s3, 9,  'conus_water_vapor.png', _wv_colormap(), vmin=195, vmax=280, domain='C', extent=CONUS_EXTENT)
+    process_geocolor(s3, domain='C', extent=CONUS_EXTENT, output_prefix='conus_')
 
     # Write a plain-text timestamp so the website can show freshness
     ts_path = os.path.join(OUTPUT_DIR, 'last_updated.txt')
