@@ -341,7 +341,7 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
         product_base = output_filename.replace('.png', '')
         shift_frames(product_base)
         output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
-        plt.savefig(output_path, dpi=300, transparent=True)
+        plt.savefig(output_path, dpi=150, transparent=True)
         plt.close()
         print(f"  Saved: {output_path}")
 
@@ -447,7 +447,7 @@ def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None):
 
     shift_frames('geocolor')
     output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=300, transparent=True)
+    plt.savefig(output_path, dpi=150, transparent=True)
     plt.close()
     print(f"  Saved (daytime): {output_path}")
 
@@ -533,7 +533,7 @@ def _render_geocolor_night(s3_client):
 
     shift_frames('geocolor')
     output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=300, transparent=True)
+    plt.savefig(output_path, dpi=150, transparent=True)
     plt.close()
     print(f"  Saved (nighttime): {output_path}")
 
