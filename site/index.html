@@ -170,7 +170,7 @@
             "Water Vapor (Band 9)": waterVaporLayer
         };
 
-        L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
+        var layersControl = L.control.layers({}, overlayMaps, {collapsed: false}).addTo(map);
 
         // Show GeoColor by default
         geocolorLayer.addTo(map);
@@ -288,6 +288,61 @@
             { layer: infraredLayer,   product: 'infrared'    },
             { layer: waterVaporLayer, product: 'water_vapor' }
         ];
+
+        // ----------------------------------------------------------------
+        // Tropical Cyclone Sector Overlays
+        // Loaded dynamically from data/cyclones.json written by process_data.py.
+        // Each active storm gets four product layers at max native resolution
+        // (GeoColor 2 km, Visible 0.5 km, Infrared 2 km, Water Vapor 2 km)
+        // cropped to a ±SECTOR_DEG box around the storm centre.
+        // ----------------------------------------------------------------
+        fetch('data/cyclones.json?nocache=' + Date.now())
+            .then(function(r) { return r.json(); })
+            .then(function(manifest) {
+                var sector = manifest.sector_deg || 6.0;
+                var storms = manifest.storms || [];
+                if (storms.length === 0) return;
+
+                storms.forEach(function(storm) {
+                    var lat   = storm.lat;
+                    var lon   = storm.lon;
+                    var sid   = storm.id;
+                    var label = storm.name + ' (' + storm.id.toUpperCase() + ')';
+                    // Leaflet imageBounds: [[south, west], [north, east]]
+                    var bounds = [
+                        [lat - sector, lon - sector],
+                        [lat + sector, lon + sector]
+                    ];
+
+                    var tcProducts = [
+                        { suffix: 'GeoColor (RGB)',       base: 'geocolor_tc_'    + sid, opacity: 0.95 },
+                        { suffix: 'Visible (Band 2)',      base: 'visible_tc_'     + sid, opacity: 0.85 },
+                        { suffix: 'Infrared (Band 13)',    base: 'infrared_tc_'    + sid, opacity: 0.85 },
+                        { suffix: 'Water Vapor (Band 9)', base: 'water_vapor_tc_' + sid, opacity: 0.85 }
+                    ];
+
+                    tcProducts.forEach(function(p) {
+                        var tcLayer = L.imageOverlay(
+                            'data/' + p.base + '_00.png',
+                            bounds,
+                            { opacity: p.opacity }
+                        );
+                        // Add to control with name "IDA (EP01) — GeoColor (RGB)" etc.
+                        layersControl.addOverlay(tcLayer, '\uD83C\uDF00 ' + label + ' \u2014 ' + p.suffix);
+                        // Register with the animation system
+                        layerProducts.push({ layer: tcLayer, product: p.base });
+                        // Keep legend priority up-to-date for TC IR/WV layers
+                        if (p.suffix.indexOf('Infrared') !== -1) {
+                            legendPriority.unshift({ layer: tcLayer, key: 'infrared' });
+                        } else if (p.suffix.indexOf('Water Vapor') !== -1) {
+                            legendPriority.unshift({ layer: tcLayer, key: 'watervapor' });
+                        } else if (p.suffix.indexOf('Visible') !== -1) {
+                            legendPriority.unshift({ layer: tcLayer, key: 'visible' });
+                        }
+                    });
+                });
+            })
+            .catch(function() { /* no cyclones.json yet — off-season, skip silently */ });
 
         function frameUrl(product, index) {
             var pad = index < 10 ? '0' + index : '' + index;
