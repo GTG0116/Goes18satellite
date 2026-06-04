@@ -572,22 +572,27 @@ def fetch_cyclone_list():
     raw_storms = data.get('storms', data.get('activeStorms', []))
     storms = []
     for s in raw_storms:
+        # The NHC feed nests the live position under a "current" object
+        # ({"current": {"lat": 12.5, "lon": -130.5, ...}}); fall back to the
+        # storm dict itself for flatter feed variants.
+        pos = s.get('current') if isinstance(s.get('current'), dict) else s
+
         # Try several common field names for numeric coordinates
-        lat = s.get('latitudeNumeric', s.get('lat'))
-        lon = s.get('longitudeNumeric', s.get('lon'))
+        lat = pos.get('lat', pos.get('latitudeNumeric'))
+        lon = pos.get('lon', pos.get('longitudeNumeric'))
 
         # Fall back to parsing string forms like "20.5N" / "97.5W"
-        if lat is None and 'latitude' in s:
+        if lat is None and 'latitude' in pos:
             try:
-                raw = str(s['latitude'])
+                raw = str(pos['latitude'])
                 lat = float(raw.replace('N', '').replace('S', ''))
                 if 'S' in raw:
                     lat = -lat
             except ValueError:
                 pass
-        if lon is None and 'longitude' in s:
+        if lon is None and 'longitude' in pos:
             try:
-                raw = str(s['longitude'])
+                raw = str(pos['longitude'])
                 lon = float(raw.replace('E', '').replace('W', ''))
                 if 'W' in raw:
                     lon = -lon
