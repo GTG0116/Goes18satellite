@@ -576,6 +576,14 @@ def fetch_cyclone_list():
         lat = s.get('latitudeNumeric', s.get('lat'))
         lon = s.get('longitudeNumeric', s.get('lon'))
 
+        # Some feeds nest the position under a 'current' object
+        current = s.get('current')
+        if (lat is None or lon is None) and isinstance(current, dict):
+            if lat is None:
+                lat = current.get('lat', current.get('latitudeNumeric'))
+            if lon is None:
+                lon = current.get('lon', current.get('longitudeNumeric'))
+
         # Fall back to parsing string forms like "20.5N" / "97.5W"
         if lat is None and 'latitude' in s:
             try:
