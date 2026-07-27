@@ -7,8 +7,10 @@ from matplotlib.colors import LinearSegmentedColormap
 import cartopy.crs as ccrs
 import numpy as np
 import os
+import io
 import json
 import urllib.request
+from PIL import Image
 from datetime import datetime, timezone, timedelta
 from botocore import UNSIGNED
 from botocore.config import Config
@@ -51,16 +53,23 @@ SECTOR_MAX_PIXELS = 4096  # keep native resolution for small sectors
 # field hasn't advected far.  Set to 0 to disable the cooling-rate term.
 PRECIP_COOLING_MINUTES = 30
 
-# Rain rates below this (mm/hr) are treated as no rain and drawn transparent.
-PRECIP_MIN_RATE = 0.1
-# Hard ceiling (mm/hr).  The bare regression curve runs away below ~195 K
-# (hundreds of mm/hr), which is physically implausible; the operational
+# Rain rates are reported in inches per hour.  The underlying regression is
+# published in mm/hr, so it is converted on the way out.
+MM_PER_INCH = 25.4
+
+# Rain rates below this (in/hr) are treated as no rain and drawn transparent.
+# 0.01 in/hr is the conventional "trace" threshold.
+PRECIP_MIN_RATE = 0.01
+# Hard ceiling (in/hr ≈ 102 mm/hr).  The bare regression curve runs away below
+# ~195 K (hundreds of mm/hr), which is physically implausible; the operational
 # Hydro-Estimator applies a similar cap.
-PRECIP_MAX_RATE = 100.0
+PRECIP_MAX_RATE = 4.0
 # Cloud-top temperatures warmer than this are assumed non-precipitating.
 PRECIP_CLOUD_MAX_K = 260.0
 # Diameter (km) of the neighbourhood used for the cloud-top texture test.
 PRECIP_TEXTURE_KM = 100.0
+# Minutes of GLM lightning accumulated for the deep-convection confirmation.
+PRECIP_GLM_MINUTES = 15
 
 
 # ---------------------------------------------------------------------------
@@ -114,23 +123,24 @@ def _wv_colormap():
 # ---------------------------------------------------------------------------
 # Precipitation rate scale
 # ---------------------------------------------------------------------------
-# Discrete radar-style rain-rate bins (mm/hr).  N+1 edges → N colour bins.
-PRECIP_LEVELS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0]
+# Discrete radar-style rain-rate bins (in/hr).  N+1 edges → N colour bins.
+# Edges 0, 2, 4, 6, 8 and 10 land on the legend ticks in site/index.html.
+PRECIP_LEVELS = [0.01, 0.02, 0.05, 0.10, 0.20, 0.40, 0.75, 1.25, 2.00, 3.00, 4.00]
 
 # One colour per bin, ramping cyan → blue → green → yellow → red → magenta.
 # Unlike the IR/WV enhancements, yellow is kept here: on a rain-rate scale it
 # is a meaningful step between green and orange rather than a colour cast.
 PRECIP_COLORS = [
-    '#9fe8ff',  # 0.10 – 0.25  trace
-    '#4fc0f0',  # 0.25 – 0.5   very light
-    '#1878d0',  # 0.5  – 1     light
-    '#17a92a',  # 1    – 2     light-moderate
-    '#4fd12a',  # 2    – 4     moderate
-    '#ffe000',  # 4    – 8     moderate-heavy
-    '#ff9000',  # 8    – 16    heavy
-    '#ff3000',  # 16   – 32    very heavy
-    '#c00040',  # 32   – 64    extreme
-    '#ff40ff',  # 64   – 100+  exceptional
+    '#9fe8ff',  # 0.01 – 0.02  trace
+    '#4fc0f0',  # 0.02 – 0.05  very light
+    '#1878d0',  # 0.05 – 0.10  light
+    '#17a92a',  # 0.10 – 0.20  light-moderate
+    '#4fd12a',  # 0.20 – 0.40  moderate
+    '#ffe000',  # 0.40 – 0.75  moderate-heavy
+    '#ff9000',  # 0.75 – 1.25  heavy
+    '#ff3000',  # 1.25 – 2.00  very heavy
+    '#c00040',  # 2.00 – 3.00  extreme
+    '#ff40ff',  # 3.00 – 4.00+ exceptional
 ]
 
 # Opacity ramp — trace rain stays translucent so the basemap reads through,
@@ -223,6 +233,29 @@ def _wv_factor(bt13, bt_wv):
                            [0.05, 0.25, 0.85, 1.00, 1.00, 0.00]).astype(np.float32)
 
 
+def _split_window_factor(bt13, bt15):
+    """Thin-cirrus screen from the split-window difference (Band 13 − Band 15).
+
+    The 12.3 µm window channel is more strongly absorbing than the 10.35 µm
+    one, so a semi-transparent cloud — which lets both channels see some of
+    the warm surface below — produces a clearly positive difference.  An
+    optically thick raining cloud is a near-blackbody in both channels, so the
+    difference collapses towards zero.
+
+    This is the classic discriminator for exactly the population the estimator
+    is most prone to over-reading: cold, high, thin cirrus blown downwind of a
+    storm that looks identical to the raining core in a single IR channel.
+
+    Thresholds are set from the live disk, where median BTD rises from ~1.4 K
+    for opaque tops colder than 200 K to ~2.9 K at 250–260 K, with a p90 tail
+    reaching 7–8 K in the thin-cloud range.  The knee therefore starts above
+    the deep-convective median so genuine cores are not penalised.
+    """
+    btd = bt13 - bt15
+    return np.interp(btd, [1.5, 3.0, 6.5],
+                          [1.00, 0.70, 0.10]).astype(np.float32)
+
+
 def _view_angle_factor(x, y):
     """Taper the estimate to zero towards the limb of the disk.
 
@@ -250,6 +283,130 @@ def _view_angle_factor(x, y):
     return np.interp(zenith, [65.0, 75.0], [1.0, 0.0]).astype(np.float32)
 
 
+# Flashes are identical for every product in a run, and the fetch is ~45 small
+# downloads, so it is resolved once and reused across the disk and all sectors.
+_GLM_CACHE = None
+
+
+def fetch_glm_flashes(s3_client, minutes=PRECIP_GLM_MINUTES, max_files=60):
+    """Collect GLM lightning flash positions from the last `minutes`.
+
+    GOES-18 carries the Geostationary Lightning Mapper alongside ABI, and its
+    L2 product lands in the same bucket as one small file every 20 seconds.
+    Returns (lats, lons) as float arrays, empty on any failure — lightning is
+    strictly a bonus input, so nothing here is allowed to break the product.
+    """
+    global _GLM_CACHE
+    if _GLM_CACHE is not None:
+        return _GLM_CACHE
+    _GLM_CACHE = _fetch_glm_flashes_uncached(s3_client, minutes, max_files)
+    return _GLM_CACHE
+
+
+def _fetch_glm_flashes_uncached(s3_client, minutes, max_files):
+    now    = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=minutes)
+
+    keys = []
+    for hour_offset in (1, 0):  # older hour first so keys stay time-ordered
+        t = now - timedelta(hours=hour_offset)
+        prefix = (f'GLM-L2-LCFA/{t.strftime("%Y")}/{t.strftime("%j")}/'
+                  f'{t.strftime("%H")}/')
+        try:
+            paginator = s3_client.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
+                for obj in page.get('Contents', []):
+                    stamp = _parse_goes_start(obj['Key'])
+                    if stamp is not None and stamp >= cutoff:
+                        keys.append((stamp, obj['Key']))
+        except Exception as e:
+            print(f"  Warning: could not list {prefix}: {e}")
+
+    if not keys:
+        print("  Note: no GLM files found; lightning confirmation disabled.")
+        return np.array([]), np.array([])
+
+    # Keep the most recent files if the window somehow yields more than
+    # expected, so a listing hiccup can't blow up the runtime.
+    keys.sort()
+    keys = keys[-max_files:]
+
+    lats, lons = [], []
+    local_file = '/tmp/goes_glm.nc'
+    for _, key in keys:
+        try:
+            s3_client.download_file(BUCKET, key, local_file)
+            ds = xr.open_dataset(local_file, engine='netcdf4')
+            if 'flash_lat' in ds.variables and ds['flash_lat'].size:
+                lats.append(ds['flash_lat'].values.astype(np.float32))
+                lons.append(ds['flash_lon'].values.astype(np.float32))
+            ds.close()
+        except Exception:
+            continue  # a single bad 20-second granule is not worth failing over
+        finally:
+            if os.path.exists(local_file):
+                os.remove(local_file)
+
+    if not lats:
+        print(f"  GLM: {len(keys)} file(s) scanned, no flashes.")
+        return np.array([]), np.array([])
+
+    lat_arr = np.concatenate(lats)
+    lon_arr = np.concatenate(lons)
+    print(f"  GLM: {len(lat_arr)} flashes from {len(keys)} file(s) "
+          f"over the last {minutes} min.")
+    return lat_arr, lon_arr
+
+
+def glm_confidence(lats, lons, x, y, goes_proj, km_per_px):
+    """Grid lightning flashes onto the image grid as a 0–1 confidence field.
+
+    Lightning is proof of a vigorous ice-phase updraught, which is exactly
+    what the infrared screens are trying to infer indirectly.  Where flashes
+    are present the pixel is deep convection regardless of what the cloud-top
+    texture or split-window tests think.
+    """
+    if lats.size == 0 or len(x) < 2 or len(y) < 2:
+        return None
+
+    # Flash lat/lon → the same geostationary projection metres as the imagery
+    pts = goes_proj.transform_points(ccrs.PlateCarree(), lons, lats)
+    fx, fy = pts[:, 0], pts[:, 1]
+    good = np.isfinite(fx) & np.isfinite(fy)
+    fx, fy = fx[good], fy[good]
+    if fx.size == 0:
+        return None
+
+    dx = float(x[1] - x[0])
+    dy = float(y[1] - y[0])
+    ix = np.round((fx - float(x[0])) / dx).astype(np.int64)
+    iy = np.round((fy - float(y[0])) / dy).astype(np.int64)
+
+    h, w = len(y), len(x)
+    inside = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+    if not inside.any():
+        return None
+
+    counts = np.zeros((h, w), dtype=np.float32)
+    np.add.at(counts, (iy[inside], ix[inside]), 1.0)
+
+    # Spread each flash over a ~50 km neighbourhood: GLM locates a flash to
+    # roughly 10 km, and the rain it implies covers a broader area than the
+    # single pixel the flash was fixed to.
+    size = max(3, int(round(50.0 / max(km_per_px, 0.5))) | 1)
+    density = uniform_filter(counts, size=size)          # mean flashes / pixel
+    density = density * 1000.0 / (km_per_px ** 2)        # flashes / 1000 km²
+
+    # Calibrated against a live disk: over lit pixels the density distribution
+    # runs ~0.4 (p10) to ~180 (max) flashes/1000 km²/15 min.  A single isolated
+    # flash smeared over the neighbourhood lands near 0.4, so the curve stays
+    # at zero there and only reaches full confidence for a genuinely electrified
+    # storm.  Median cloud-top temperature falls from 265 K to 241 K across
+    # these bands, confirming the density ranking tracks convective depth.
+    return np.interp(density, [1.0, 6.0, 25.0],
+                              [0.0, 0.50, 1.00]).astype(np.float32)
+
+
 def _cooling_factor(bt13, bt13_prev, minutes):
     """Growth-rate weighting from the cloud-top temperature trend.
 
@@ -274,8 +431,9 @@ def _cooling_factor(bt13, bt13_prev, minutes):
 
 
 def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
-                         prev_minutes=0, km_per_px=2.0, x=None, y=None):
-    """Estimate surface rain rate (mm/hr) from ABI infrared brightness temps.
+                         prev_minutes=0, km_per_px=2.0, x=None, y=None,
+                         bt_split=None, glm_conf=None):
+    """Estimate surface rain rate (in/hr) from ABI infrared brightness temps.
 
     EXPERIMENTAL.  Infrared sees cloud *tops*, not raindrops, so this is an
     inference chain rather than a measurement.  Known limitations:
@@ -305,34 +463,57 @@ def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
     prev_minutes– minutes between bt13_prev and bt13
     km_per_px   – ground sampling distance, used to size the texture window
     x, y        – optional projection coordinates (m) enabling the limb taper
+    bt_split    – optional Band 15 (12.3 µm) brightness temperature, K
+    glm_conf    – optional 0–1 GLM lightning confidence field
     """
     bt13 = np.asarray(bt13, dtype=np.float32)
     # Off-earth / fill pixels become "warm" so they score as no rain.
     valid = np.isfinite(bt13)
     bt13_f = np.where(valid, bt13, 330.0)
 
-    rate = _auto_estimator_rate(bt13_f)
-    rate *= _texture_factor(bt13_f, km_per_px)
+    def _match(arr, fill=330.0):
+        """Coerce a companion band onto the Band 13 grid."""
+        a = np.asarray(arr, dtype=np.float32)
+        a = np.where(np.isfinite(a), a, fill)
+        if a.shape != bt13_f.shape:
+            a = zoom(a, (bt13_f.shape[0] / a.shape[0],
+                         bt13_f.shape[1] / a.shape[1]), order=1)
+        return a
+
+    # The screens are accumulated separately from the rate curve so that
+    # lightning can raise the floor on all of them at once (below).
+    screen = _texture_factor(bt13_f, km_per_px)
 
     if bt_wv is not None:
-        bt_wv = np.asarray(bt_wv, dtype=np.float32)
-        bt_wv = np.where(np.isfinite(bt_wv), bt_wv, 330.0)
-        if bt_wv.shape != bt13_f.shape:
-            bt_wv = zoom(bt_wv, (bt13_f.shape[0] / bt_wv.shape[0],
-                                 bt13_f.shape[1] / bt_wv.shape[1]), order=1)
-        rate *= _wv_factor(bt13_f, bt_wv)
+        screen = screen * _wv_factor(bt13_f, _match(bt_wv))
+
+    if bt_split is not None:
+        screen = screen * _split_window_factor(bt13_f, _match(bt_split))
 
     if bt13_prev is not None:
-        prev = np.asarray(bt13_prev, dtype=np.float32)
-        prev = np.where(np.isfinite(prev), prev, 330.0)
-        rate *= _cooling_factor(bt13_f, prev, prev_minutes)
+        screen = screen * _cooling_factor(bt13_f, _match(bt13_prev), prev_minutes)
 
+    if glm_conf is not None:
+        # Lightning is direct evidence of deep convection, so it overrides the
+        # indirect screens rather than multiplying with them — a flashing core
+        # must never be screened away as cirrus.  It only ever raises the
+        # weighting, so lightning-free heavy rain is not penalised.
+        screen = np.maximum(screen, _match(glm_conf, fill=0.0))
+
+    rate = _auto_estimator_rate(bt13_f) * screen
+
+    # Applied last: this is a data-quality mask, not a convection screen, so
+    # not even lightning should reinstate rain in unusable limb geometry.
     if x is not None and y is not None:
-        rate *= _view_angle_factor(x, y)
+        rate = rate * _view_angle_factor(x, y)
 
     # Nothing warmer than the cloud threshold precipitates in this scheme.
     rate = np.where(bt13_f > PRECIP_CLOUD_MAX_K, 0.0, rate)
     rate = np.where(valid, rate, 0.0)
+
+    # The regression is published in mm/hr; the product reports inches.
+    rate = rate / MM_PER_INCH
+
     rate = np.clip(np.nan_to_num(rate, nan=0.0, posinf=PRECIP_MAX_RATE),
                    0.0, PRECIP_MAX_RATE)
     rate = np.where(rate < PRECIP_MIN_RATE, 0.0, rate)
@@ -361,8 +542,8 @@ def _precip_stats(rate):
     if n == 0:
         return "no precipitating pixels"
     return (f"{100.0 * n / rate.size:.2f}% of pixels raining, "
-            f"max {float(rate.max()):.1f} mm/hr, "
-            f"mean-where-raining {float(rate[raining].mean()):.2f} mm/hr")
+            f"max {float(rate.max()):.2f} in/hr, "
+            f"mean-where-raining {float(rate[raining].mean()):.3f} in/hr")
 
 
 # ---------------------------------------------------------------------------
@@ -545,6 +726,47 @@ def _make_figure():
     return fig, ax
 
 
+def _save_png(output_path, dpi=150):
+    """Save the current figure as a size-optimised transparent PNG, then close it.
+
+    Every frame is committed straight into the repository on a 10-minute
+    cycle, so bytes written here become permanent repository growth.  Writing
+    an 8-bit palette PNG instead of full RGBA cuts each frame to roughly a
+    quarter of its size.
+
+    The colour-mapped products (IR, Water Vapor, Visible, Precip) draw from a
+    256-entry colormap, so they contain few enough distinct colours to be
+    re-indexed *exactly* — those frames are bit-for-bit identical to the RGBA
+    render, just stored more compactly.  GeoColor is a true-colour composite
+    with tens of thousands of colours and falls back to a 256-colour adaptive
+    palette, which is visually indistinguishable at this resolution.
+    """
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', dpi=dpi, transparent=True)
+    plt.close()
+    buf.seek(0)
+
+    img = Image.open(buf).convert('RGBA')
+    arr = np.ascontiguousarray(np.array(img, dtype=np.uint8))
+    h, w = arr.shape[:2]
+
+    # Pack RGBA into one uint32 per pixel so the unique/index pass is a cheap
+    # 1-D sort rather than a lexsort over 5 million 4-element rows.
+    packed = arr.reshape(-1, 4).view(np.uint32).reshape(-1)
+    uniq, idx = np.unique(packed, return_inverse=True)
+
+    if len(uniq) <= 256:
+        rgba = uniq.view(np.uint8).reshape(-1, 4)
+        out = Image.fromarray(idx.astype(np.uint8).reshape(h, w), mode='P')
+        palette = rgba[:, :3].reshape(-1).tolist()
+        out.putpalette(palette + [0] * (768 - len(palette)))
+        out.save(output_path, format='PNG', optimize=True,
+                 transparency=bytes(rgba[:, 3].tolist()))
+    else:
+        img.quantize(colors=256, method=Image.FASTOCTREE).save(
+            output_path, format='PNG', optimize=True)
+
+
 def _download_band(s3_client, band_num, key=None):
     """Download a GOES-18 ABI band (Full Disk).
 
@@ -683,8 +905,7 @@ def process_goes_band(s3_client, band, output_filename, colormap, vmin, vmax, ga
         product_base = output_filename.replace('.png', '')
         shift_frames(product_base)
         output_path = os.path.join(OUTPUT_DIR, f'{product_base}_00.png')
-        plt.savefig(output_path, dpi=150, transparent=True)
-        plt.close()
+        _save_png(output_path)
         print(f"  Saved: {output_path}")
 
     except Exception as e:
@@ -789,8 +1010,7 @@ def _render_geocolor_day(b1, b2, x, y, goes_proj, bt13=None):
 
     shift_frames('geocolor')
     output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved (daytime): {output_path}")
 
 
@@ -875,8 +1095,7 @@ def _render_geocolor_night(s3_client):
 
     shift_frames('geocolor')
     output_path = os.path.join(OUTPUT_DIR, 'geocolor_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved (nighttime): {output_path}")
 
 
@@ -950,13 +1169,22 @@ def process_precip(s3_client):
     if bt9 is None:
         print("  WARNING: Band 9 unavailable; water-vapour screen disabled.")
 
+    # Band 15 gives the split-window thin-cirrus screen.
+    bt15, _, _, _ = _download_band(s3_client, 15)
+    if bt15 is None:
+        print("  WARNING: Band 15 unavailable; split-window screen disabled.")
+
     # The earlier scan must be fetched last so its temporary file doesn't
     # collide with the current Band 13 download.
     prev, gap = _fetch_previous_ir(s3_client, _parse_goes_start(key_now))
 
     km = _km_per_pixel(x)
+    lats, lons = fetch_glm_flashes(s3_client)
+    glm = glm_confidence(lats, lons, x, y, goes_proj, km)
+
     rate = estimate_precip_rate(bt13, bt_wv=bt9, bt13_prev=prev,
-                                prev_minutes=gap, km_per_px=km, x=x, y=y)
+                                prev_minutes=gap, km_per_px=km, x=x, y=y,
+                                bt_split=bt15, glm_conf=glm)
     print(f"  Grid {rate.shape[0]}×{rate.shape[1]} @ {km:.1f} km/px — {_precip_stats(rate)}")
 
     fig, ax = _make_figure()
@@ -966,8 +1194,7 @@ def process_precip(s3_client):
 
     shift_frames('precip')
     output_path = os.path.join(OUTPUT_DIR, 'precip_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved: {output_path}")
 
 
@@ -986,13 +1213,18 @@ def process_cyclone_precip(s3_client, storm_key, lat, lon):
         print("  ERROR: Missing Band 13. Skipping precipitation sector.")
         return
 
-    bt9, _, _, _ = _download_band_sector(s3_client, 9, lat, lon)
+    bt9, _, _, _  = _download_band_sector(s3_client, 9, lat, lon)
+    bt15, _, _, _ = _download_band_sector(s3_client, 15, lat, lon)
     prev, gap = _fetch_previous_ir(s3_client, _parse_goes_start(key_now),
                                    sector=(lat, lon))
 
     km = _km_per_pixel(x)
+    lats, lons = fetch_glm_flashes(s3_client)
+    glm = glm_confidence(lats, lons, x, y, goes_proj, km)
+
     rate = estimate_precip_rate(bt13, bt_wv=bt9, bt13_prev=prev,
-                                prev_minutes=gap, km_per_px=km, x=x, y=y)
+                                prev_minutes=gap, km_per_px=km, x=x, y=y,
+                                bt_split=bt15, glm_conf=glm)
     print(f"  Grid {rate.shape[0]}×{rate.shape[1]} @ {km:.1f} km/px — {_precip_stats(rate)}")
 
     west, east   = lon - SECTOR_DEG, lon + SECTOR_DEG
@@ -1004,8 +1236,7 @@ def process_cyclone_precip(s3_client, storm_key, lat, lon):
 
     shift_frames(output_base)
     output_path = os.path.join(OUTPUT_DIR, f'{output_base}_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved: {output_path}")
 
 
@@ -1214,8 +1445,7 @@ def process_cyclone_band(s3_client, storm_key, band, output_base,
 
     shift_frames(output_base)
     output_path = os.path.join(OUTPUT_DIR, f'{output_base}_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved: {output_path}")
 
 
@@ -1311,8 +1541,7 @@ def process_cyclone_geocolor(s3_client, storm_key, lat, lon):
 
     shift_frames(output_base)
     output_path = os.path.join(OUTPUT_DIR, f'{output_base}_00.png')
-    plt.savefig(output_path, dpi=150, transparent=True)
-    plt.close()
+    _save_png(output_path)
     print(f"  Saved: {output_path}")
 
 

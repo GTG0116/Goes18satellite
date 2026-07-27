@@ -212,15 +212,16 @@
             // Matches estimate_precip_rate() in process_data.py
             precip: {
                 title: 'Precipitation Rate — experimental',
-                subtitle: 'Estimated from Bands 13 + 9',
+                subtitle: 'Bands 13 + 9 + 15, with GLM lightning',
                 gradient: precipGradient(),
-                // Bin edges 0.1 / 0.5 / 2 / 8 / 32 / 100 fall at 0, 20, 40,
-                // 60, 80 and 100 % of the bar.
-                ticks: ['0.1', '0.5', '2', '8', '32', '100+'],
-                unit: 'mm/hr',
+                // Bin edges 0.01 / 0.05 / 0.20 / 0.75 / 2.00 / 4.00 fall at
+                // 0, 20, 40, 60, 80 and 100 % of the bar.
+                ticks: ['0.01', '0.05', '0.20', '0.75', '2.00', '4.00+'],
+                unit: 'in/hr',
                 note: 'Inferred from cloud-top temperature — not a radar ' +
-                      'measurement. Misses warm rain from low cloud and can ' +
-                      'over-read non-raining cirrus.'
+                      'measurement. Misses warm rain from low cloud, so it ' +
+                      'reads as "where is the deep convection", not a full ' +
+                      'rainfall map.'
             },
 
             // Matches _ir_colormap() in process_data.py (190 – 310 K)
