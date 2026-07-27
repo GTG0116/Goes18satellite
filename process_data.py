@@ -12,7 +12,7 @@ import urllib.request
 from datetime import datetime, timezone, timedelta
 from botocore import UNSIGNED
 from botocore.config import Config
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom, uniform_filter
 
 OUTPUT_DIR = 'site/data'
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -41,6 +41,26 @@ NHC_PACIFIC_URL = (
 )
 SECTOR_DEG = 6.0          # degrees of lat/lon around the storm centre
 SECTOR_MAX_PIXELS = 4096  # keep native resolution for small sectors
+
+# ---------------------------------------------------------------------------
+# Experimental precipitation-rate estimator configuration
+# ---------------------------------------------------------------------------
+# Look this far back for a previous Band 13 scan to derive a cloud-top cooling
+# rate.  GOES-18 Full Disk cadence is 10 minutes, so 30 minutes ≈ 3 scans —
+# long enough for a measurable temperature trend, short enough that the cloud
+# field hasn't advected far.  Set to 0 to disable the cooling-rate term.
+PRECIP_COOLING_MINUTES = 30
+
+# Rain rates below this (mm/hr) are treated as no rain and drawn transparent.
+PRECIP_MIN_RATE = 0.1
+# Hard ceiling (mm/hr).  The bare regression curve runs away below ~195 K
+# (hundreds of mm/hr), which is physically implausible; the operational
+# Hydro-Estimator applies a similar cap.
+PRECIP_MAX_RATE = 100.0
+# Cloud-top temperatures warmer than this are assumed non-precipitating.
+PRECIP_CLOUD_MAX_K = 260.0
+# Diameter (km) of the neighbourhood used for the cloud-top texture test.
+PRECIP_TEXTURE_KM = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -89,6 +109,260 @@ def _wv_colormap():
         (0.92, '#ff5500'),  # 265 K  – deep orange
         (1.00, '#cc1100'),  # 280 K  – red-orange (warm / dry)
     ])
+
+
+# ---------------------------------------------------------------------------
+# Precipitation rate scale
+# ---------------------------------------------------------------------------
+# Discrete radar-style rain-rate bins (mm/hr).  N+1 edges → N colour bins.
+PRECIP_LEVELS = [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 100.0]
+
+# One colour per bin, ramping cyan → blue → green → yellow → red → magenta.
+# Unlike the IR/WV enhancements, yellow is kept here: on a rain-rate scale it
+# is a meaningful step between green and orange rather than a colour cast.
+PRECIP_COLORS = [
+    '#9fe8ff',  # 0.10 – 0.25  trace
+    '#4fc0f0',  # 0.25 – 0.5   very light
+    '#1878d0',  # 0.5  – 1     light
+    '#17a92a',  # 1    – 2     light-moderate
+    '#4fd12a',  # 2    – 4     moderate
+    '#ffe000',  # 4    – 8     moderate-heavy
+    '#ff9000',  # 8    – 16    heavy
+    '#ff3000',  # 16   – 32    very heavy
+    '#c00040',  # 32   – 64    extreme
+    '#ff40ff',  # 64   – 100+  exceptional
+]
+
+# Opacity ramp — trace rain stays translucent so the basemap reads through,
+# heavy cores are nearly opaque.
+PRECIP_ALPHAS = np.linspace(0.45, 0.95, len(PRECIP_COLORS))
+
+
+def _hex_to_rgb(h):
+    """'#rrggbb' → (r, g, b) floats in [0, 1]."""
+    h = h.lstrip('#')
+    return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+
+
+# ---------------------------------------------------------------------------
+# Experimental IR → precipitation rate estimator
+# ---------------------------------------------------------------------------
+# The core curve is the GOES Auto-Estimator power-law regression of Vicente,
+# Scofield & Menzel (1998), which fitted 10.7 µm cloud-top brightness
+# temperature against radar-derived rain rates:
+#
+#     R = 1.1183e11 · exp(-3.6382e-2 · T^1.2)      [mm/hr, T in K]
+#
+# Band 13 (10.35 µm) is the modern ABI equivalent of the GOES-8 10.7 µm
+# channel the regression was built on.
+AE_A = 1.1183e11
+AE_B = 3.6382e-2
+AE_P = 1.2
+
+# Fixed GOES-R series geostationary geometry, used for the view-angle taper.
+# Every ABI file carries these same values in goes_imager_projection.
+GOES_SAT_HEIGHT = 35786023.0  # perspective point height, m
+EARTH_RADIUS    = 6378137.0   # GRS80 semi-major axis, m
+
+
+def _auto_estimator_rate(bt):
+    """Bare Vicente et al. (1998) Auto-Estimator curve, mm/hr."""
+    # Clamp the input so the exponential can't overflow on bad/fill pixels.
+    bt = np.clip(bt, 180.0, 330.0)
+    return AE_A * np.exp(-AE_B * np.power(bt, AE_P))
+
+
+def _texture_factor(bt13, km_per_px):
+    """Convective-core vs. cirrus-anvil weighting from cloud-top texture.
+
+    The raw regression assigns rain to any cold pixel, so a wide cirrus anvil
+    blooms into a huge false rain shield.  The Hydro-Estimator's fix — adopted
+    here — compares each pixel to the mean temperature of the cloudy pixels
+    around it.  Actively growing convective cores are locally *colder* than
+    their surroundings; anvil that has spread downwind is locally *warmer*.
+
+    The multiplier only ever suppresses (max 1.0): a colder-than-average pixel
+    is already assigned more rain by the temperature curve itself, so boosting
+    it again for being cold relative to its neighbours would double-count the
+    same signal.  Returns ~0.1 for warm-relative anvil rising to 1.0 at and
+    below the local cloud mean.
+    """
+    size = int(round(PRECIP_TEXTURE_KM / max(km_per_px, 0.5)))
+    size = max(3, size | 1)  # odd window, at least 3 px
+
+    cloud = (bt13 < PRECIP_CLOUD_MAX_K).astype(np.float32)
+    # Mean over cloudy pixels only — clear-sky warmth must not dilute the mean.
+    bt_sum = uniform_filter(np.where(cloud > 0, bt13, 0.0).astype(np.float32), size=size)
+    bt_cnt = uniform_filter(cloud, size=size)
+    local_mean = np.where(bt_cnt > 1e-6, bt_sum / np.maximum(bt_cnt, 1e-6), bt13)
+
+    # Positive anomaly = colder than surroundings = likely active core
+    anomaly = local_mean - bt13
+    return np.interp(anomaly, [-6.0, -2.0, 0.0],
+                              [0.10, 0.55, 1.00]).astype(np.float32)
+
+
+def _wv_factor(bt13, bt_wv):
+    """Deep-convection screen from the water-vapour minus IR difference.
+
+    When a cloud top reaches the upper troposphere both Band 9 and Band 13 see
+    the same surface, so the difference approaches zero (and goes slightly
+    positive for overshooting tops that punch into the stratospheric
+    inversion).  Either side of that narrow window means no deep convection:
+
+      • Strongly negative — Band 9 still senses cold upper-tropospheric
+        moisture well above a mid-level or thin cloud, so it reads far colder
+        than the window channel.  Cold-but-dry cirrus lands here.
+      • Strongly positive — the window channel is seeing something colder than
+        the mid-troposphere itself, which no cloud top does.  That is a cold
+        *surface*: polar ice or high terrain.  Without this branch the
+        Antarctic ice sheet scores as continent-sized extreme convection.
+    """
+    diff = bt_wv - bt13
+    return np.interp(diff, [-35.0, -20.0, -8.0, 0.0, 5.0, 18.0],
+                           [0.05, 0.25, 0.85, 1.00, 1.00, 0.00]).astype(np.float32)
+
+
+def _view_angle_factor(x, y):
+    """Taper the estimate to zero towards the limb of the disk.
+
+    Near the edge of the full disk each pixel is smeared over a huge, highly
+    oblique footprint and the line of sight passes through so much atmosphere
+    that cloud-top temperatures are badly biased.  Beyond roughly 65° of
+    satellite zenith angle the retrieval is not usable, which is also where
+    the radial sampling artefacts appear.
+
+    x, y are projection coordinates in metres (scan angle × satellite height).
+    """
+    # Angular distance from nadir along the scan, in radians.  Broadcast the
+    # 1-D axes rather than meshgrid — on a 2712² grid that saves allocating
+    # two full float64 copies.
+    xs = np.asarray(x, dtype=np.float32)[None, :] / GOES_SAT_HEIGHT
+    ys = np.asarray(y, dtype=np.float32)[:, None] / GOES_SAT_HEIGHT
+    scan = np.sqrt(xs * xs + ys * ys)
+
+    # Law of sines on the satellite–Earth-centre–pixel triangle:
+    #   sin(scan) = (R_e / (R_e + h)) · sin(zenith)
+    ratio = (EARTH_RADIUS + GOES_SAT_HEIGHT) / EARTH_RADIUS
+    s = np.clip(np.sin(scan) * ratio, -1.0, 1.0)  # >1 would be off-earth
+    zenith = np.degrees(np.arcsin(s))
+
+    return np.interp(zenith, [65.0, 75.0], [1.0, 0.0]).astype(np.float32)
+
+
+def _cooling_factor(bt13, bt13_prev, minutes):
+    """Growth-rate weighting from the cloud-top temperature trend.
+
+    A cooling top is a rising, still-building updraught and rains hardest; a
+    warming top is a collapsing or spreading anvil where rainfall is already
+    tapering off.  A single IR image cannot tell those two apart even though
+    they look identical in temperature — comparing two scans can, and it is
+    the largest single skill gain available from infrared alone.
+
+    Weighted towards growth rather than symmetric about zero: sustained deep
+    convection cools its top continuously while it builds, so a top that has
+    stopped cooling is usually already past its peak.
+    """
+    if bt13_prev is None or minutes <= 0 or bt13_prev.shape != bt13.shape:
+        return 1.0
+
+    # Normalise the trend to K per 15 minutes so the thresholds below are
+    # independent of the actual gap between the two scans.
+    trend = (bt13 - bt13_prev) * (15.0 / minutes)
+    return np.interp(trend, [-8.0, -2.0, 0.0, 2.0, 6.0],
+                            [1.20, 1.05, 0.85, 0.50, 0.20]).astype(np.float32)
+
+
+def estimate_precip_rate(bt13, bt_wv=None, bt13_prev=None,
+                         prev_minutes=0, km_per_px=2.0, x=None, y=None):
+    """Estimate surface rain rate (mm/hr) from ABI infrared brightness temps.
+
+    EXPERIMENTAL.  Infrared sees cloud *tops*, not raindrops, so this is an
+    inference chain rather than a measurement.  Known limitations:
+
+      • Warm rain from shallow maritime clouds is invisible — those tops are
+        warmer than PRECIP_CLOUD_MAX_K and are scored as zero.
+      • The result is therefore biased towards the convective part of the rain
+        field.  Light stratiform rain falling from tops in the 240–260 K range
+        is scored below the display threshold and simply disappears, so the
+        rain area is too small and the surviving area skews heavy.  Read this
+        as "where is the deep convection and roughly how hard is it", not as a
+        complete rainfall map.
+      • Cold cirrus that is not raining can still be scored as rain when the
+        texture and water-vapour screens fail to catch it.
+      • No parallax correction, so cold tops are displaced from the rain
+        beneath them by tens of km at high latitudes and near the limb.
+      • Nothing is estimated beyond ~75° satellite zenith angle, so the outer
+        ring of the disk is intentionally blank.
+      • The Auto-Estimator regression was fitted over the continental US in
+        summer; it over-predicts in dry environments and under-predicts in
+        moist tropical ones.  The operational Hydro-Estimator corrects this
+        with model precipitable water and RH, which are not used here.
+
+    bt13        – Band 13 (10.35 µm) brightness temperature, K
+    bt_wv       – optional Band 9 (6.95 µm) brightness temperature, K
+    bt13_prev   – optional earlier Band 13 scan on the same grid, K
+    prev_minutes– minutes between bt13_prev and bt13
+    km_per_px   – ground sampling distance, used to size the texture window
+    x, y        – optional projection coordinates (m) enabling the limb taper
+    """
+    bt13 = np.asarray(bt13, dtype=np.float32)
+    # Off-earth / fill pixels become "warm" so they score as no rain.
+    valid = np.isfinite(bt13)
+    bt13_f = np.where(valid, bt13, 330.0)
+
+    rate = _auto_estimator_rate(bt13_f)
+    rate *= _texture_factor(bt13_f, km_per_px)
+
+    if bt_wv is not None:
+        bt_wv = np.asarray(bt_wv, dtype=np.float32)
+        bt_wv = np.where(np.isfinite(bt_wv), bt_wv, 330.0)
+        if bt_wv.shape != bt13_f.shape:
+            bt_wv = zoom(bt_wv, (bt13_f.shape[0] / bt_wv.shape[0],
+                                 bt13_f.shape[1] / bt_wv.shape[1]), order=1)
+        rate *= _wv_factor(bt13_f, bt_wv)
+
+    if bt13_prev is not None:
+        prev = np.asarray(bt13_prev, dtype=np.float32)
+        prev = np.where(np.isfinite(prev), prev, 330.0)
+        rate *= _cooling_factor(bt13_f, prev, prev_minutes)
+
+    if x is not None and y is not None:
+        rate *= _view_angle_factor(x, y)
+
+    # Nothing warmer than the cloud threshold precipitates in this scheme.
+    rate = np.where(bt13_f > PRECIP_CLOUD_MAX_K, 0.0, rate)
+    rate = np.where(valid, rate, 0.0)
+    rate = np.clip(np.nan_to_num(rate, nan=0.0, posinf=PRECIP_MAX_RATE),
+                   0.0, PRECIP_MAX_RATE)
+    rate = np.where(rate < PRECIP_MIN_RATE, 0.0, rate)
+    return rate.astype(np.float32)
+
+
+def _precip_rgba(rate):
+    """Map a rain-rate field to an RGBA image using the discrete scale."""
+    colors = np.array([_hex_to_rgb(c) for c in PRECIP_COLORS], dtype=np.float32)
+    alphas = PRECIP_ALPHAS.astype(np.float32)
+
+    # digitize returns 0 below the first edge, so subtract 1 to index bins.
+    idx = np.digitize(rate, PRECIP_LEVELS) - 1
+    has_rain = idx >= 0
+    idx = np.clip(idx, 0, len(PRECIP_COLORS) - 1)
+
+    rgb = colors[idx]
+    a   = np.where(has_rain, alphas[idx], 0.0)
+    return np.dstack([rgb, a[..., None]]).astype(np.float32)
+
+
+def _precip_stats(rate):
+    """One-line coverage summary, useful for spotting a broken run in the log."""
+    raining = rate >= PRECIP_MIN_RATE
+    n = int(raining.sum())
+    if n == 0:
+        return "no precipitating pixels"
+    return (f"{100.0 * n / rate.size:.2f}% of pixels raining, "
+            f"max {float(rate.max()):.1f} mm/hr, "
+            f"mean-where-raining {float(rate[raining].mean()):.2f} mm/hr")
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +443,61 @@ def get_latest_goes_file(s3_client, band, domain='F'):
     return None
 
 
+def _parse_goes_start(key):
+    """Extract the scan start time from a GOES filename.
+
+    Keys look like  OR_ABI-L2-CMIPF-M6C13_G18_s20262081900208_e..._c....nc
+    where the _s field is sYYYYDDDHHMMSSt (t = tenths of a second).
+    Returns a timezone-aware datetime, or None if the field can't be parsed.
+    """
+    for part in os.path.basename(key).split('_'):
+        if part.startswith('s') and len(part) >= 14 and part[1:14].isdigit():
+            try:
+                return datetime.strptime(part[1:14], '%Y%j%H%M%S').replace(
+                    tzinfo=timezone.utc)
+            except ValueError:
+                return None
+    return None
+
+
+def get_goes_file_near(s3_client, band, minutes_back, domain='F'):
+    """Find the GOES-18 file whose scan time is closest to `minutes_back` ago.
+
+    Lists the target hour and the hour before it (the target may sit near an
+    hour boundary) and picks the nearest scan.  Returns (key, actual_minutes)
+    where actual_minutes is the true gap from the newest scan available, or
+    (None, 0) if nothing suitable was found.
+    """
+    now    = datetime.now(timezone.utc)
+    target = now - timedelta(minutes=minutes_back)
+
+    band_str  = f'C{band:02d}_G18'
+    candidates = []
+    for hour_offset in (0, 1):
+        t = target - timedelta(hours=hour_offset)
+        prefix = (f'ABI-L2-CMIP{domain}/{t.strftime("%Y")}/{t.strftime("%j")}/'
+                  f'{t.strftime("%H")}/')
+        try:
+            resp = s3_client.list_objects_v2(Bucket=BUCKET, Prefix=prefix)
+            for obj in resp.get('Contents', []):
+                if band_str not in obj['Key']:
+                    continue
+                stamp = _parse_goes_start(obj['Key'])
+                if stamp is not None:
+                    candidates.append((stamp, obj['Key']))
+        except Exception as e:
+            print(f"  Warning: could not list {prefix}: {e}")
+
+    # Only accept scans at or before the target time — a later one would
+    # shrink the gap and could even be the current scan itself.
+    candidates = [c for c in candidates if c[0] <= target]
+    if not candidates:
+        return None, 0
+
+    stamp, key = max(candidates, key=lambda c: c[0])
+    return key, stamp
+
+
 def _make_figure():
     """Create a figure rendered in satellite-centred Web Mercator to match Leaflet.
 
@@ -216,15 +545,18 @@ def _make_figure():
     return fig, ax
 
 
-def _download_band(s3_client, band_num):
+def _download_band(s3_client, band_num, key=None):
     """Download a GOES-18 ABI band (Full Disk).
+
+    key – optional explicit S3 key; when omitted the latest scan is used.
 
     Returns (data_array, x_metres, y_metres, goes_proj).
     data_array contains raw float values with NaNs intact (no fill applied).
     Returns (None, None, None, None) on any failure.
     """
     print(f"  Downloading Band {band_num}...")
-    key = get_latest_goes_file(s3_client, band_num)
+    if key is None:
+        key = get_latest_goes_file(s3_client, band_num)
     if key is None:
         print(f"  ERROR: No Band {band_num} data found in the last 6 hours.")
         return None, None, None, None
@@ -549,6 +881,135 @@ def _render_geocolor_night(s3_client):
 
 
 # ---------------------------------------------------------------------------
+# Experimental precipitation rate product
+# ---------------------------------------------------------------------------
+
+def _km_per_pixel(x):
+    """Ground sampling distance in km from the projection x coordinates.
+
+    x is scan angle × satellite height, so the spacing equals the nadir
+    ground resolution.  Pixels grow towards the limb; this is the nadir value.
+    """
+    if x is None or len(x) < 2:
+        return 2.0
+    return abs(float(x[1] - x[0])) / 1000.0
+
+
+def _fetch_previous_ir(s3_client, current_time, sector=None):
+    """Fetch the Band 13 scan ~PRECIP_COOLING_MINUTES ago for the trend term.
+
+    current_time – scan start time of the current Band 13 image, so the gap is
+                   measured scan-to-scan rather than against the wall clock.
+    sector       – None for full disk, or (lat, lon) for a cyclone sector crop.
+    Returns (bt_array, gap_minutes).  Returns (None, 0) if the lookback is
+    disabled or the earlier scan can't be retrieved — the estimator then
+    simply runs without the cooling-rate term.
+    """
+    if PRECIP_COOLING_MINUTES <= 0:
+        return None, 0
+
+    key, stamp = get_goes_file_near(s3_client, 13, PRECIP_COOLING_MINUTES)
+    if key is None:
+        print("  Note: no earlier Band 13 scan found; skipping cooling-rate term.")
+        return None, 0
+
+    ref = current_time if current_time is not None else datetime.now(timezone.utc)
+    gap = (ref - stamp).total_seconds() / 60.0
+    if gap <= 0:
+        print("  Note: lookback scan is not older than the current scan; "
+              "skipping cooling-rate term.")
+        return None, 0
+    print(f"  Lookback scan: {os.path.basename(key)}  ({gap:.0f} min before current)")
+
+    if sector is None:
+        prev, _, _, _ = _download_band(s3_client, 13, key=key)
+    else:
+        prev, _, _, _ = _download_band_sector(s3_client, 13, sector[0], sector[1], key=key)
+
+    if prev is None:
+        return None, 0
+    return prev, gap
+
+
+def process_precip(s3_client):
+    """Render the experimental IR-derived precipitation rate (Full Disk)."""
+    print(f"\n--- Precipitation Rate (experimental, IR-derived) ---")
+
+    key_now = get_latest_goes_file(s3_client, 13)
+    if key_now is None:
+        print("  ERROR: No Band 13 data found. Skipping precipitation.")
+        return
+
+    bt13, x, y, goes_proj = _download_band(s3_client, 13, key=key_now)
+    if bt13 is None:
+        print("  ERROR: Missing Band 13. Skipping precipitation.")
+        return
+
+    # Band 9 sharpens the deep-convection screen but is not required.
+    bt9, _, _, _ = _download_band(s3_client, 9)
+    if bt9 is None:
+        print("  WARNING: Band 9 unavailable; water-vapour screen disabled.")
+
+    # The earlier scan must be fetched last so its temporary file doesn't
+    # collide with the current Band 13 download.
+    prev, gap = _fetch_previous_ir(s3_client, _parse_goes_start(key_now))
+
+    km = _km_per_pixel(x)
+    rate = estimate_precip_rate(bt13, bt_wv=bt9, bt13_prev=prev,
+                                prev_minutes=gap, km_per_px=km, x=x, y=y)
+    print(f"  Grid {rate.shape[0]}×{rate.shape[1]} @ {km:.1f} km/px — {_precip_stats(rate)}")
+
+    fig, ax = _make_figure()
+    ax.imshow(_precip_rgba(rate), origin='upper',
+              extent=(x[0], x[-1], y[-1], y[0]), transform=goes_proj,
+              aspect='auto', interpolation='nearest')
+
+    shift_frames('precip')
+    output_path = os.path.join(OUTPUT_DIR, 'precip_00.png')
+    plt.savefig(output_path, dpi=150, transparent=True)
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
+def process_cyclone_precip(s3_client, storm_key, lat, lon):
+    """Experimental precipitation rate cropped to a cyclone sector."""
+    print(f"  --- Precipitation sector ({storm_key}) ---")
+    output_base = f'precip_tc_{storm_key}'
+
+    key_now = get_latest_goes_file(s3_client, 13)
+    if key_now is None:
+        print("  ERROR: No Band 13 data found. Skipping precipitation sector.")
+        return
+
+    bt13, x, y, goes_proj = _download_band_sector(s3_client, 13, lat, lon, key=key_now)
+    if bt13 is None:
+        print("  ERROR: Missing Band 13. Skipping precipitation sector.")
+        return
+
+    bt9, _, _, _ = _download_band_sector(s3_client, 9, lat, lon)
+    prev, gap = _fetch_previous_ir(s3_client, _parse_goes_start(key_now),
+                                   sector=(lat, lon))
+
+    km = _km_per_pixel(x)
+    rate = estimate_precip_rate(bt13, bt_wv=bt9, bt13_prev=prev,
+                                prev_minutes=gap, km_per_px=km, x=x, y=y)
+    print(f"  Grid {rate.shape[0]}×{rate.shape[1]} @ {km:.1f} km/px — {_precip_stats(rate)}")
+
+    west, east   = lon - SECTOR_DEG, lon + SECTOR_DEG
+    south, north = lat - SECTOR_DEG, lat + SECTOR_DEG
+    fig, ax = _make_figure_sector(west, east, south, north)
+    ax.imshow(_precip_rgba(rate), origin='upper',
+              extent=(x[0], x[-1], y[-1], y[0]), transform=goes_proj,
+              aspect='auto', interpolation='nearest')
+
+    shift_frames(output_base)
+    output_path = os.path.join(OUTPUT_DIR, f'{output_base}_00.png')
+    plt.savefig(output_path, dpi=150, transparent=True)
+    plt.close()
+    print(f"  Saved: {output_path}")
+
+
+# ---------------------------------------------------------------------------
 # Tropical cyclone sector helpers
 # ---------------------------------------------------------------------------
 
@@ -646,17 +1107,19 @@ def _make_figure_sector(west, east, south, north):
     return fig, ax
 
 
-def _download_band_sector(s3_client, band_num, lat, lon):
+def _download_band_sector(s3_client, band_num, lat, lon, key=None):
     """Download a GOES-18 full-disk band and crop to the cyclone sector.
 
     The sector is a ±SECTOR_DEG lat/lon box around (lat, lon).
+    key – optional explicit S3 key; when omitted the latest scan is used.
     Returns the cropped array at native resolution (no subsampling unless
     the crop still exceeds SECTOR_MAX_PIXELS on either axis).
     Returns (None, None, None, None) on failure or if the storm is outside
     the GOES-18 field of view.
     """
     print(f"  Downloading Band {band_num} (sector)...")
-    key = get_latest_goes_file(s3_client, band_num)
+    if key is None:
+        key = get_latest_goes_file(s3_client, band_num)
     if key is None:
         print(f"  ERROR: No Band {band_num} data found.")
         return None, None, None, None
@@ -861,6 +1324,7 @@ def process_cyclones(s3_client):
       • Visible    — 0.5 km (Band 2)
       • Infrared   — 2 km  (Band 13)
       • Water Vapor — 2 km (Band 9)
+      • Precip Rate — 2 km (experimental, Bands 13 + 9)
 
     Also writes site/data/cyclones.json so the web viewer can build overlays
     dynamically without hardcoding storm names or positions.
@@ -894,6 +1358,8 @@ def process_cyclones(s3_client):
         )
         # GeoColor — 2 km effective
         process_cyclone_geocolor(s3_client, sid, lat, lon)
+        # Precipitation Rate — experimental, derived from Bands 13 + 9
+        process_cyclone_precip(s3_client, sid, lat, lon)
 
         manifest['storms'].append({
             'id':   sid,
@@ -947,6 +1413,12 @@ def main():
 
     # GeoColor — natural colour (day) or IR+city-lights composite (night)
     process_geocolor(s3)
+
+    # Precipitation Rate — EXPERIMENTAL.  Band 13 cloud-top temperature run
+    # through the Vicente et al. (1998) Auto-Estimator regression, screened by
+    # cloud-top texture, the Band 9 water-vapour difference, and the cloud-top
+    # cooling rate.  See estimate_precip_rate() for what this can and cannot do.
+    process_precip(s3)
 
     # Tropical cyclone sectors — max-resolution crops around each active storm
     process_cyclones(s3)
